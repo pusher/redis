@@ -14,6 +14,28 @@ import (
 
 //------------------------------------------------------------------------------
 
+type Sentinel interface {
+	MasterAddr() (string, error)
+	QuorumMasterAddr() (string, error)
+	MasterChangeChan() <-chan interface{}
+	Close() error
+}
+
+func NewSentinel(failoverOpt *FailoverOptions) Sentinel {
+	opt := failoverOpt.options()
+	opt.init()
+
+	failover := &sentinelFailover{
+		masterName:    failoverOpt.MasterName,
+		sentinelAddrs: failoverOpt.SentinelAddrs,
+		masterChanged: make(chan interface{}),
+
+		opt: opt,
+	}
+
+	return failover
+}
+
 // FailoverOptions are used to configure a failover client and should
 // be passed to NewFailoverClient.
 type FailoverOptions struct {
@@ -195,6 +217,13 @@ func (c *SentinelClient) Master(name string) *StringStringMapCmd {
 	return cmd
 }
 
+// Checks whether the sentinel has a quorum
+func (c *SentinelClient) CkQuorum(name string) *StringCmd {
+	cmd := NewStringCmd("sentinel", "ckquorum", name)
+	c.Process(cmd)
+	return cmd
+}
+
 type sentinelFailover struct {
 	sentinelAddrs []string
 
@@ -208,6 +237,8 @@ type sentinelFailover struct {
 	_masterAddr string
 	sentinel    *SentinelClient
 	pubsub      *PubSub
+
+	masterChanged chan interface{}
 }
 
 func (c *sentinelFailover) Close() error {
@@ -237,6 +268,15 @@ func (c *sentinelFailover) dial() (net.Conn, error) {
 
 func (c *sentinelFailover) MasterAddr() (string, error) {
 	addr, err := c.masterAddr()
+	if err != nil {
+		return "", err
+	}
+	c.switchMaster(addr)
+	return addr, nil
+}
+
+func (c *sentinelFailover) QuorumMasterAddr() (string, error) {
+	addr, err := c.quorumMasterAddr()
 	if err != nil {
 		return "", err
 	}
@@ -290,6 +330,104 @@ func (c *sentinelFailover) masterAddr() (string, error) {
 	return "", errors.New("redis: all sentinels are unreachable")
 }
 
+func (c *sentinelFailover) quorumMasterAddr() (string, error) {
+	addr := c.getQuorumMasterAddr()
+	if addr != "" {
+		return addr, nil
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for i, sentinelAddr := range c.sentinelAddrs {
+		sentinel := NewSentinelClient(&Options{
+			Addr: sentinelAddr,
+
+			MaxRetries: c.opt.MaxRetries,
+
+			DialTimeout:  c.opt.DialTimeout,
+			ReadTimeout:  c.opt.ReadTimeout,
+			WriteTimeout: c.opt.WriteTimeout,
+
+			PoolSize:           c.opt.PoolSize,
+			PoolTimeout:        c.opt.PoolTimeout,
+			IdleTimeout:        c.opt.IdleTimeout,
+			IdleCheckFrequency: c.opt.IdleCheckFrequency,
+
+			TLSConfig: c.opt.TLSConfig,
+		})
+
+		quorum, err := sentinel.CkQuorum(c.masterName).Result()
+		if err != nil || !parseQuorumResult(quorum) {
+			if err != nil {
+				internal.Logf("sentinel: CkQuorum name=%q failed: %s",
+					c.masterName, err)
+			} else {
+				internal.Logf("sentinel: CkQuorum name=%q returned false",
+					c.masterName)
+			}
+			_ = sentinel.Close()
+			continue
+		}
+
+		masterAddr, err := sentinel.GetMasterAddrByName(c.masterName).Result()
+		if err != nil {
+			internal.Logf("sentinel: GetMasterAddrByName master=%q failed: %s",
+				c.masterName, err)
+			_ = sentinel.Close()
+			continue
+		}
+
+		// Push working sentinel to the top.
+		c.sentinelAddrs[0], c.sentinelAddrs[i] = c.sentinelAddrs[i], c.sentinelAddrs[0]
+		c.setSentinel(sentinel)
+
+		addr := net.JoinHostPort(masterAddr[0], masterAddr[1])
+		return addr, nil
+	}
+
+	return "", errors.New("redis: unable to reach a sentinel with quorum")
+}
+
+func (c *sentinelFailover) getQuorumMasterAddr() string {
+	c.mu.RLock()
+	sentinel := c.sentinel
+	c.mu.RUnlock()
+
+	if sentinel == nil {
+		return ""
+	}
+
+	quorum, err := sentinel.CkQuorum(c.masterName).Result()
+	if err != nil || !parseQuorumResult(quorum) {
+		if err != nil {
+			internal.Logf("sentinel: CkQuorum name=%q failed: %s",
+				c.masterName, err)
+		} else {
+			internal.Logf("sentinel: CkQuorum name=%q false", c.masterName)
+		}
+		c.mu.Lock()
+		if c.sentinel == sentinel {
+			c.closeSentinel()
+		}
+		c.mu.Unlock()
+		return ""
+	}
+
+	addr, err := sentinel.GetMasterAddrByName(c.masterName).Result()
+	if err != nil {
+		internal.Logf("sentinel: GetMasterAddrByName name=%q failed: %s",
+			c.masterName, err)
+		c.mu.Lock()
+		if c.sentinel == sentinel {
+			c.closeSentinel()
+		}
+		c.mu.Unlock()
+		return ""
+	}
+
+	return net.JoinHostPort(addr[0], addr[1])
+}
 func (c *sentinelFailover) getMasterAddr() string {
 	c.mu.RLock()
 	sentinel := c.sentinel
@@ -314,6 +452,12 @@ func (c *sentinelFailover) getMasterAddr() string {
 	return net.JoinHostPort(addr[0], addr[1])
 }
 
+func (c *sentinelFailover) MasterChangeChan() <-chan interface{} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.masterChanged
+}
+
 func (c *sentinelFailover) switchMaster(addr string) {
 	c.mu.RLock()
 	masterAddr := c._masterAddr
@@ -324,6 +468,9 @@ func (c *sentinelFailover) switchMaster(addr string) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	close(c.masterChanged)
+	c.masterChanged = make(chan interface{})
 
 	internal.Logf("sentinel: new master=%q addr=%q",
 		c.masterName, addr)
@@ -408,4 +555,8 @@ func contains(slice []string, str string) bool {
 		}
 	}
 	return false
+}
+
+func parseQuorumResult(res string) bool {
+	return strings.HasPrefix(res, "OK")
 }
